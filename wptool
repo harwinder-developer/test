@@ -1,0 +1,1955 @@
+#!/bin/bash
+
+function now() {
+  date -u +"%Y%m%d-%H%M%S"
+}
+
+# remove specific aliases that may cause troubles
+remove_aliases="mysql echo tail mkdir awk fgrep egrep"
+for ALIAS in $remove_aliases ; do
+  if [ -n "$(alias -p | grep "alias $ALIAS=")" ] ; then
+    unalias $ALIAS
+  fi
+done
+
+# only remove grep if it is using something other than --color
+if [ -n "$(alias -p | grep "alias grep=")" ] ; then
+  if [ -z "$(alias -p | grep "alias grep='grep --color'")" ] ; then
+    unalias grep
+  fi
+fi
+
+function wpcore() {
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "
+This tool downloads the latest core, a new core of the current version, or a
+specified version.
+
+  Usage: wpcore <cur|db|new|#.#.#>
+
+\t    <blank>\n\t\tOnly download the latest archive of core files for wordpress.
+\t    cur\n\t\tDownload and install/replace the core wordpress files 
+\t\tbased on the version specified in wp-includes/version.php
+\t    db\n\t\tDownload and install/replace the core wordpress files
+\t\tbased on the database version. Useful if the files
+\t\tare corrupt/missing or if 'cur' can't get the version.
+\t    new\n\t\tDownload and install/replace the newest version 
+\t\tof the core wordpress files. This can be used to upgrade
+\t\twordpress or install a brand new installation.
+\t    #.#.#\n\t\tDownload and install/replace a specific version of 
+\t\tthe Wordpress core, in the form of #.#.#
+\t    curall|ca\n\t\tDownload and replace core files for all installations
+\t    updateall|ua\n\t\tUpdate all installations to the current version
+"
+    return
+  elif [[ $1 == "cur" ]]; then file=wordpress-$(wpver -q | tail -n 1 | awk '{print $1}')
+  elif [[ $1 == "db" ]]; then file=wordpress-$(wpver -q | awk '{print $3}')
+  elif [[ $1 == "new" ]]; then file="latest"
+  elif [[ -n $1 ]]; then file="wordpress-$1"
+  else file="latest"
+  fi
+
+  if [[ "$1" == "ca" ]] || [[ "$1" == "curall" ]] ; then 
+    current_dir="$(pwd)"
+    for i in $(find $(pwd) -iname 'wp-config.php' | sed 's/wp-config.php//g'); do
+      cd "$i"
+      echo "Entering site $i"
+      ver=`wpver | grep 'WP version' | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]{1,2})?' | uniq `
+      echo "Reintalling core files for version $ver"
+      wpcore $ver
+    done
+    cd "$current_dir"
+    return
+  fi
+
+  if [[ "$1" == "ua" ]] || [[ "$1" == "updateall" ]]; then 
+    current_dir="$(pwd)"
+    for i in $(find $(pwd) -iname 'wp-config.php' | sed 's/wp-config.php//g'); do
+      cd "$i"
+      wpcore new
+    done
+    cd "$current_dir"
+    return
+  fi
+
+  if [[ "$file" == "wordpress-Unknown" ]]; then
+    echo Unknown version!
+    return 9
+  fi
+  
+  if [[ ! -f "$file.tar.gz" ]]; then
+    echo "Downloading install file $file.tar.gz"
+    # --no-check-certificate is for older versions of wget
+    # don't be silent, in case it stalls and we are just waiting.....
+    wget --no-check-certificate "https://wordpress.org/$file.tar.gz"
+    if [[ $? -ne 0 ]] ; then
+      echo "Unable to download $file.tar.gz"
+      rm -f "$file.tar.gz"
+      return 9
+    fi
+  fi
+  
+  # check if file was properly downloaded and not corrupt
+  echo "Verifying downloaded file..."
+  tar tf "$file.tar.gz" > /dev/null
+  tar_exit_code=$?
+  if [[ $tar_exit_code -ne 0 ]] ; then
+    echo -e "\nError: Downloaded file was corrupt: tar gave error code $tar_exit_code"
+    rm -f "$file.tar.gz"
+    echo -e "Removed corrupt file: $file.tar.gz"
+    echo "Try running the command again...."
+    return 9
+  else
+    echo "$file.tar.gz appears to be okay."
+  fi
+  
+  if [[ -z $1 ]] ; then
+    # we were only suppose to download the file
+    echo "Archive downloaded"
+    return
+  fi
+  
+  __wp_rand_string
+  temp=$(now)_$wp_rand_string
+  echo "Checking for WP files..."
+  local wpfiles=$(find -maxdepth 1 -name "wp-*" -o -name index.php -o -name license.txt -o -name readme.html -o -name xmlrpc.php)
+  if [[ -z "$wpfiles" ]]; then
+    echo "No old WP files found..."
+  else
+    oldcore="core_$temp"
+    echo "Old WP files found! Moving them to $oldcore..."
+    mkdir "$oldcore"
+    while read -r f; do mv "$f" "$oldcore"; done <<< "$wpfiles"
+  fi
+
+  tar -xf "$file.tar.gz" --strip-components=1 && echo "Extracted new core files..."
+  rm -rf "$file.tar.gz" && echo "Removed $file.tar.gz..."
+  if [[ -d "$oldcore/wp-content" ]]; then
+    mv wp-content wp-content_stock && echo "Moved default wp-content to wp-content_stock..."
+    mv "$oldcore/wp-content" . && echo "Moved old wp-content back into place..."
+    rm "wp-content_stock" -rf && echo "Removed wp-content_stock"
+  fi
+  if [[ -f "$oldcore/wp-config.php" ]]; then
+    cp "$oldcore/wp-config.php" .
+    echo "Copied old wp-config.php back into place..."
+    # run fixes - no need if we don't have a config file
+    wpfix
+  else
+    # Do not do this. On a new install the user will get:
+    #    "Error establishing a database connection"
+    # because we have copied default (incorrect) data into place...
+    #cp wp-config-sample.php wp-config.php
+    #echo "Copied wp-config-sample.php into place..."
+    echo "No config was found. You need to go to your site and run through the setup."
+    # if it's an upgrade, run upgrades
+  fi
+  
+  # seal up core_xxxxx in a tar.gz file
+  if [[ -d "$oldcore" ]] ; then
+    # remove any wp-config.php if still in oldcore
+    rm -f $oldcore/wp-config*
+    tar czf $oldcore.tar.gz $oldcore
+    rm $oldcore -rf && echo "Old core files placed into a tar file"
+  fi
+  
+  # search for malware
+  echo
+  echo
+  echo "*** WARNING: *** This tool is not meant to be used to fix hacked sites."
+  echo " If the site you are fixing is hacked, this tool may be able to get the"
+  echo " site back up, but the malware will rehack the site within a few days"
+  echo " (or hours/moments), making you or your customer have a miserable day..."
+  echo
+  echo "Performing a quick check of the main files..."
+  scanresults="$(wpscan quick script)"
+  if [[ -n $scanresults ]] ; then
+    echo "
+ERROR!!! This site appears to (still) contain malware. While it may load, 
+the site will reinfect itself within the next few days (or sooner)
+
+    This site ***really*** needs to be checked and cleaned.
+    
+Begin list HACKED files (or so they appear), as './path/to/file: code-example'
+
+$scanresults
+
+  End list HACKED files.
+  
+ And if you are a tech working for a hosting company, you should talk to and
+ notify those in charge of scanning and suspending acounts, before this 
+ infection spreads, or (more) spam messages get sent out.
+"
+
+  # should we put the site into maintenance mode?
+  else
+    echo "No common hack files found. If in doubt, you may try 'wpscan full"
+  fi
+}
+
+function wpfix() {
+  echo
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "This tool runs various built-in Wordpress functions and fixes,
+and can run a few others too.
+
+Usage:\twpfix [perms]
+
+\t(No options)
+\t\tClears WordPress's cache and runs any needed database updates.
+\t\tThis is safe, as it's what you normally do when you upgrade WP.
+
+\tperms
+\t\tFix the permissions of WP files to writeable.
+"
+    return
+  elif [[ $1 == "perms" ]] || [[ $1 == "--perms" ]] ; then
+  # changing perms does not need wp-config, and wp-admin could be blocked
+  # TODO: allow user to specify perms (755 777, 640, etc)
+#    "There are several ways we can change your permissions:
+#     [1] chmod a-rwx,u=rwX,go=rX -R files
+#     [2] find2perl files -type [d/f] | perl | chmod 755/644 
+#     [3] find files -type [d/f] | chmod 755/644
+#     (Note that the find commands will actually be 2 commands)
+#     If you don't know, '1' is a good choice.
+#     How would you like to reset the permissions?  [1,2,3]?"
+    echo "Resetting permissions"
+    # these first ones may or may not be here...
+    chmod -c -f a-rwx,u=rwX,go=rX xmlrpc.php .htaccess
+    chmod -c -f a-rwx,u=rwX,go=rX -R wp-* index.php \
+      && echo "Successfully changed file permissions" \
+      || echo "Failed to fix permissions or you are missing files"
+    return $?
+    
+  elif [[ ! -f wp-config.php || ! -f wp-admin/upgrade-functions.php ]]; then
+    echo -e "Could not find one or more of the necessary files (wp-config.php or wp-admin/upgrade-functions.php)!\n"
+    return 9
+  elif [[ -n $1 ]] ; then
+    echo "Unknown option(s): $*"
+    wpfix -h
+    return 9
+  fi
+  
+  echo "Loading WordPress.."
+  php -q <<"EOF" && echo "Ran fix..." || echo Error running fix!
+<?php
+  require_once('wp-config.php');
+  echo "WordPress loaded...\n";
+  require_once('wp-admin/upgrade-functions.php');
+  echo "Upgrade functions loaded...\n";
+  wp_cache_flush();
+  echo "Object cache flushed...\n";
+  make_db_current();
+  echo "Database made current...\n";
+  /*upgrade_160();
+  echo "Data upgraded...\n";*/
+  $wp_rewrite->flush_rules();
+  echo "Rewrite rules flushed...\n";
+  wp_cache_flush();
+  echo "Object cache flushed...\n";
+  /* clear plugin caches. If you know of a plugin
+   * and how to have it clear the caches, please
+   * let me know and I will see about putting it in here */
+  require_once('wp-load.php');
+  require_once('wp-includes/pluggable.php');
+  if (function_exists('w3tc_flush_all')) {
+    w3tc_flush_all();
+    echo "Cleared W3 Total Caches\n"; 
+  }
+  if (function_exists('wp_cache_clear_cache')) {
+    wp_cache_clear_cache();
+    echo "Cleared WP Super Cache files\n";
+  }
+?>
+EOF
+  echo
+  echo "Also try wptests and wptrace. They help to identify errors."
+  echo
+}
+
+function wpht() {
+  echo
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "This tool generates a new .htaccess file.\n\nUsage:\n\n\twpht\n"
+    return
+  elif [[ ! -f wp-config.php || ! -f wp-admin/includes/misc.php ]]; then
+    echo -e "Could not find one or more of the necessary files:\n"
+    echo -e "\twp-config.php\n\twp-admin/includes/misc.php\n"
+    return 9
+  fi
+  temp=$(now)
+  [[ -f .htaccess ]] && cp .htaccess .htaccess_$temp
+  echo "Loading WordPress..."
+  php -q <<"EOF" && echo "Generated .htaccess rules..." || echo Error writing to .htaccess!
+<?php
+  $_SERVER['SCRIPT_NAME'] = "";
+  require_once('wp-config.php');
+  require_once('wp-admin/includes/misc.php');
+  $rules = explode( "\n", $wp_rewrite->mod_rewrite_rules() );
+  echo "Inserting (or updating) the following rules into .htaccess:\n\n";
+  foreach ($rules as $r) {
+    echo "$r\n";
+  }
+  insert_with_markers( '.htaccess', 'WordPress', $rules );
+?>
+EOF
+  echo
+}
+
+function wpconn() {
+  [[ -z $1 || $1 != wp* ]] && return
+  if [[ ! -f wp-config.php ]]; then
+    echo -e "\nCould not find wp-config.php!\n"
+    return 9
+  fi
+  myconn=""
+  read -r dbhost dbname dbpass dbuser dbprefix <<< $(cat wp-config.php | egrep "^[^/].*[\"']DB_(NAME|USER|PASSWORD|HOST[^_])|table_prefix" | sort -d | sed "s/.*[\"']\(.*\)[\"'].*;.*/\1/" )
+  #[[ -z $dbprefix ]] && dbprefix=$junk #sometimes there isn't a junk entry
+  q="USE $dbname; "
+  if [[ $1 == "wpdbimport" ]]; then
+    echo "Starting import..."
+    mysql -h "$dbhost" -u "$dbuser" -p"$dbpass" "$dbname" < "$2" && echo -e "Imported file '$2' to database '$dbname'.\n" || echo -e "Failed to import file '$2' to database '$dbname'!\n"
+    return
+  elif [[ $1 == "wpdbimportgz" ]]; then
+    echo "Starting import..."
+    gunzip < "$2" | mysql -h "$dbhost" -u "$dbuser" -p"$dbpass" "$dbname" && echo -e "Imported gzipped file '$2' to database '$dbname'.\n" || echo -e "Failed to import file '$2' to database '$dbname'!\n"
+    return
+  elif [[ $1 == "wpdbexport" ]]; then
+    echo "Starting export..."
+    file="$2"
+    [[ -z "$file" ]] && __wp_rand_string && file="$dbname"_$(now)-${wp_rand_string}.sql
+    mysqldump -h "$dbhost" -u "$dbuser" -p"$dbpass" "$dbname" > "$file" && echo -e "Exported database '$dbname' to file '$file'.\n" || echo -e "Failed to export database '$dbname' to file '$file'!\n"
+    return
+  elif [[ $1 == "wpdbexportgz" ]]; then
+    echo "Starting export..."
+    file="$2"
+    [[ -z "$file" ]] && __wp_rand_string && file="$dbname"_$(now)-${wp_rand_string}.sql.gz
+    mysqldump -h "$dbhost" -u "$dbuser" -p"$dbpass" "$dbname" | gzip > "$file" && echo -e "Exported gzipped database '$dbname' to file '$file'.\n" || echo -e "Failed to export database '$dbname' to file '$file'!\n"
+    return
+  elif [[ $1 == "wpdbdrop" ]]; then q='DROP database '$dbname'; CREATE DATABASE '$dbname';';
+  elif [[ $1 == "wpdb" ]]; then q=$q'SHOW tables like "'$dbprefix'%";';
+  elif [[ $1 == "wpdbver" ]]; then q=$q'SELECT option_value FROM '$dbprefix'options WHERE option_name = "db_version";'
+  elif [[ $1 == "wpurl" ]]; then q=$q'SELECT option_id, option_name, option_value FROM '$dbprefix'options WHERE option_name = "siteurl" OR option_name = "home";'
+  elif [[ $1 == "wpurlmod" ]]; then
+    [[ -z $2 ]] && echo No URL specified! && return 9
+    q=$q'UPDATE '$dbprefix'options SET option_value="'$2'" WHERE option_name="siteurl" OR option_name="home";'
+  # getting and setting only siteurl or homeurl
+  elif [[ $1 == "wpsiteurl" ]]; then q=$q'SELECT option_id, option_name, option_value FROM '$dbprefix'options WHERE option_name = "siteurl";'
+  elif [[ $1 == "wphomeurl" ]]; then q=$q'SELECT option_id, option_name, option_value FROM '$dbprefix'options WHERE option_name = "home";'
+  elif [[ $1 == "wpsiteurlmod" ]]; then
+    [[ -z $2 ]] && echo No URL specified! && return 9
+    q=$q'UPDATE '$dbprefix'options SET option_value="'$2'" WHERE option_name="siteurl";'
+  elif [[ $1 == "wphomeurlmod" ]]; then
+    [[ -z $2 ]] && echo No URL specified! && return 9
+    q=$q'UPDATE '$dbprefix'options SET option_value="'$2'" WHERE option_name="home";'
+  # search the posts and rename the old url to a new one
+  elif [[ $1 == "wpurlreplace" ]]; then
+    [[ -z "$2" || -z "$3" ]] && echo To replace urls in posts there has to be two urls! && return 9
+    # I don't do a search and replace in the options table, as I've seen themes destroyed that way
+    q=$q'UPDATE '$dbprefix'posts SET guid = replace(guid, "'$2'","'$3'");
+        UPDATE '$dbprefix'posts SET post_content = replace(post_content, "'$2'", "'$3'");
+        UPDATE '$dbprefix'postmeta SET meta_value = replace(meta_value, "'$2'", "'$3'");'
+  elif [[ $1 == "wpplug" ]]; then q=$q'SELECT option_value FROM '$dbprefix'options WHERE option_name = "active_plugins";'
+  elif [[ $1 == "wpplugdisableall" ]]; then q=$q'UPDATE '$dbprefix'options SET option_value="a:0:{}" WHERE option_name = "active_plugins";'
+  elif [[ $1 == "wpplugrestoreall" ]]; then 
+    if [[ -z "$wpt_disabled_plugins" ]] ; then
+      echo "Variable \$wpt_disabled_plugins is empty. Nothing to do." && return 9
+    fi
+    wpt_disabled_plugins_noquot="$(echo $wpt_disabled_plugins | sed 's/"/\\"/g')"
+    q=$q'UPDATE '$dbprefix'options SET option_value="'$wpt_disabled_plugins_noquot'" WHERE option_name = "active_plugins";'
+  elif [[ $1 == "wpplugset" ]]; then 
+    if [[ -z "$2" ]] ; then
+      echo "No plugin data was given. If you are trying to disable all, try 'wpconn wpplugdisableall'"
+      return 9
+    fi
+    wpt_plugins_set=$2
+    wpt_plugins_set_noquot="$(echo $wpt_plugins_set | sed 's/"/\\"/g')"
+    q=$q'UPDATE '$dbprefix'options SET option_value="'$wpt_plugins_set_noquot'" WHERE option_name = "active_plugins";'
+  elif [[ $1 == "wptheme" ]]; then q=$q'SELECT option_id, option_name, option_value FROM '$dbprefix'options WHERE option_name = "stylesheet" OR option_name = "template";'
+  elif [[ $1 == "wpthememod"* ]]; then
+    [[ -z $2 ]] && echo No theme specified! && return 9
+    if [[ $1 == "wpthememod" ]]; then q=$q'UPDATE '$dbprefix'options SET option_value="'$2'" WHERE option_name="stylesheet" OR option_name="template" OR option_name="current_theme";'
+    elif [[ $1 == "wpthememods" ]]; then q=$q'UPDATE '$dbprefix'options SET option_value="'$2'" WHERE option_name="stylesheet";'
+    elif [[ $1 == "wpthememodt" ]]; then q=$q'UPDATE '$dbprefix'options SET option_value="'$2'" WHERE option_name="template" OR option_name="current_theme";'
+    else echo -e "\tInvalid query"! && return 1
+    fi
+  elif [[ $1 == "wpuser" ]]; then q=$q'SELECT * FROM '$dbprefix'users LIMIT 23;'
+  elif [[ $1 == "wpuserall" ]]; then q=$q'SELECT * FROM '$dbprefix'users;'
+  elif [[ $1 == "wpuseradmins" ]]; then q=$q'SELECT ID, user_login FROM '$dbprefix'users JOIN '$dbprefix'usermeta ON ('$dbprefix'users.ID = '$dbprefix'usermeta.user_id) WHERE meta_value=10;'
+  elif [[ $1 == "wpuser1" ]]; then q=$q'SELECT user_login FROM '$dbprefix'users WHERE ID=1;'
+  elif [[ $1 == "wpuserinfo" ]]; then q=$q'SELECT ID, user_login, user_email, user_status, umeta_id, meta_key, meta_value FROM '$dbprefix'users JOIN '$dbprefix'usermeta ON ('$dbprefix'users.ID = '$dbprefix'usermeta.user_id) WHERE ID='$2';'
+  elif [[ $1 == "wpusera" ]]; then q=$q'DELETE FROM '$dbprefix'usermeta WHERE user_id='$2' AND (meta_key="'$dbprefix'capabilities" OR meta_key="'$dbprefix'user_level"); INSERT INTO '$dbprefix'usermeta (user_id,meta_key,meta_value) VALUES ('$2', "'$dbprefix'capabilities", '"'a:1:{s:13:\"administrator\";b:1;}'"'); INSERT INTO '$dbprefix'usermeta (user_id,meta_key,meta_value) VALUES ('$2', "'$dbprefix'user_level", 10); SELECT user_login FROM '$dbprefix'users WHERE ID='$2';'
+  elif [[ $1 == "wpuserp" ]]; then q=$q'UPDATE '$dbprefix'users SET user_pass=MD5("'$3'") WHERE ID='$2'; SELECT user_login FROM '$dbprefix'users WHERE ID='$2';'
+  elif [[ $1 == "wpuseru" ]]; then q=$q'SELECT user_login FROM '$dbprefix'users WHERE ID='$2'; UPDATE '$dbprefix'users SET user_login="'$3'" WHERE ID='$2';'
+  elif [[ $1 == "wpuserd" ]]; then q=$q'SELECT user_login FROM '$dbprefix'users WHERE ID='$2'; DELETE FROM '$dbprefix'users WHERE ID='$2'; DELETE FROM '$dbprefix'usermeta WHERE user_id='$2';'
+  elif [[ $1 == "wpusernew" ]]; then
+    # generate 20 char random password
+    __wp_rand_string
+    deleteme_pass="$wp_rand_string"
+    q=$q'INSERT INTO '$dbprefix'users (user_login, user_pass, user_email) VALUES ("deleteme", MD5("'$deleteme_pass'"), "deleteme@example.com"); SET @new_id=LAST_INSERT_ID(); INSERT INTO '$dbprefix'usermeta (user_id,meta_key,meta_value) VALUES (@new_id, "'$dbprefix'capabilities", '"'a:1:{s:13:\"administrator\";b:1;}'"'); INSERT INTO '$dbprefix'usermeta (user_id,meta_key,meta_value) VALUES (@new_id, "'$dbprefix'user_level", 10); SELECT @new_id;'
+  elif [[ $1 == "wptablesize" ]] ; then
+    # show columns here as the user needs to see them to understand the db size.
+    mysql -u "$dbuser" -p"$dbpass" -h "$dbhost" -e 'SELECT TABLE_NAME, 
+      table_rows, round(((data_length + index_length) / 1024 / 1024),2) \
+      "Size in MB" FROM information_schema.TABLES WHERE table_schema = "'$dbname'";'
+      return
+  
+  elif [[ $1 == "wpdbrepair" ]]   ; then 
+    mysqlcheck -p"$dbpass" -u "$dbuser" -h "$dbhost" "$dbname" -r 2>&1 | egrep -v '(Warning: Using a password on the command line|Warning: Using a password on the command line interface can be insecure)'
+    retval=$?
+    [ $retval -eq 0 ] && echo "Successfully repaired database" || echo "FAILED to repair database"
+    return $retval
+  elif [[ $1 == "wpdboptimize" ]] ; then 
+    mysqlcheck -p"$dbpass" -u "$dbuser" -h "$dbhost" "$dbname" -o 2>&1 | egrep -v '(Warning: Using a password on the command line|Warning: Using a password on the command line interface can be insecure)'
+    retval=$?
+    [ $retval -eq 0 ] && echo "Successfully optimized database" || echo "FAILED to optimize database"
+    return $retval
+    
+  elif [[ $1 == "wpdbtransientscount" ]] ; then q=$q'SELECT COUNT(*) FROM '$dbprefix'options WHERE option_name LIKE ("'%\_transient\_%'")'
+  elif [[ $1 == "wpdbtransientsremove" ]] ; then q=$q'DELETE FROM '$dbprefix'options WHERE option_name LIKE ("'%\_transient\_%'")'
+  elif [[ $1 == "wpdbsize" ]] ; then
+#if [ 1 == 1 ] ; then
+#    # get db size and number of tables and other info
+#    q=$q'SELECT s.schema_name,
+#    CONCAT(IFNULL(ROUND((SUM(t.data_length)+SUM(t.index_length)) 
+#      /1024/1024,2),0.00),"Mb") total_size, 
+#    CONCAT(IFNULL(ROUND(((SUM(t.data_length)+SUM(t.index_length))-
+#      SUM(t.data_free))/1024/1024,2),0.00),"Mb") data_used,
+#    CONCAT(IFNULL(ROUND(SUM(data_free)/1024/1024,2),0.00),"Mb") data_free,
+#    IFNULL(ROUND((((SUM(t.data_length)+SUM(t.index_length))-SUM(t.data_free)) 
+#      /((SUM(t.data_length)+SUM(t.index_length)))*100),2),0) pct_used,
+#    COUNT(table_name) total_tables 
+#      FROM INFORMATION_SCHEMA.SCHEMATA s
+#      LEFT JOIN INFORMATION_SCHEMA.TABLES t ON s.schema_name = t.table_schema 
+#      WHERE s.schema_name = "'$dbname'";'
+#else #simpler but does not get number of tables
+#      q=$q'SELECT "'$dbname'", 
+#      SUM( data_length + index_length ) / 1024 / 1024 "Data Base Size in MB", 
+#      SUM( data_free )/ 1024 / 1024 "Free Space in MB"
+#      FROM information_schema.TABLES;'
+#else
+      # shared hosts dont always allow the above, so we will count each one
+      q=$q'SELECT ROUND(SUM((data_length + index_length)/1024/1024),2) total_size,
+        COUNT(table_name) total_tables FROM information_schema.TABLES 
+        WHERE table_schema = "'$dbname'";'
+
+#fi
+  else echo -e "\tInvalid argument was given to wpconn... nothing to do" && return 1
+  fi
+  # --skip-column-names do not show columns as they will get in the way
+  # (and some versions of mysql show them while others dont)
+  # and dont use the users default config.
+  myconn=$(mysql --skip-column-names --batch -u "$dbuser" -p"$dbpass" -h "$dbhost" -e "$q" 2>&1 | \
+    egrep -v '(Warning: Using a password on the command line|Warning: Using a password on the command line interface can be insecure)')
+  if [[ 1 -eq 0 ]]; then #Debug
+    echo -e "\nConnected to the database..."
+    echo -e "Query:\n\n\t$q"
+    echo -e "$myconn".
+  elif [[ $myconn == "ERROR"* ]]; then 
+    echo "There was a database error: $myconn"
+    return 9
+  fi
+  # check that we saved it properly
+  if [[ $1 == "wpplugrestoreall" ]]; then 
+    wpconn "wpplug"
+    wpt_disabled_plugins_test=$(echo "$myconn")
+    if [[ "$wpt_disabled_plugins_test" != "$wpt_disabled_plugins" ]] ; then
+      echo "I checked the actual saved active_plugins and it doesn't match what it should be"
+      return 9
+    fi
+  elif [[ $1 == "wpplugset" ]]; then 
+    wpconn "wpplug"
+    wpt_plugins_set_test=$(echo "$myconn")
+    if [[ "$wpt_plugins_set_test" != "$wpt_plugins_set" ]] ; then
+      echo "I checked the actual saved active_plugins key and it doesn't match what it should be"
+      return 9
+    fi
+  fi
+}
+
+function wpdb() {
+  #Need to include a optimize/fix option
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "\nThis tool tests the database connectivity based on settings in the wp-config.php file, and can import/export a database based on its settings.\n"
+    echo -e "Usage:\n"
+    echo -e "\twpdb [option [param]]\n"
+    echo -e "\t-i FILE\n\t\texport current database to file FILE.\n\t\tThe specified FILE must end in .sql\n"
+    echo -e "\t-e [FILE]\n\t\texport current database to optional file FILE.\n\t\tIf a FILE is specified, it must end in .sql\n"
+    echo -e "\t-s\n\t\tshow the size of all tables and the database\n"
+    echo -e "\t-o\n\t\toptimize the wordpress database\n"
+    echo -e "\t-r\n\t\toptimize and repair the wordpress database\n"
+    echo -e "\t-oa|--fix-all\n\t\trepair and optimize all wordpress databases\n"
+    echo -e "\t-t\n\tcheck the number of transients in the _options table"
+    echo -e "\t--rt\n\tremove all transients from the _options table"
+    return
+  elif [[ ! -f wp-config.php ]]; then echo Could not find wp-config.php! && return 9
+  fi
+  
+  if [[ $1 == '-t' ]] ; then
+    wpconn wpdbtransientscount
+    transients="$(echo $myconn | grep -Eo '[0-9]+')"
+    echo -e "\n\tTotal Transients: $transients\n"
+    return
+  fi
+  if [[ $1 == '--rt' ]] ; then
+    # count how many we have now
+    wpconn wpdbtransientscount
+    transients_before="$(echo $myconn | grep -Eo '[0-9]+')"
+    # remove them
+    wpconn wpdbtransientsremove
+    # get the count now, and show how many we removed.
+    wpconn wpdbtransientscount
+    transients_after="$(echo $myconn | grep -Eo '[0-9]+')"
+    echo -e "\n\t$(expr $transients_before - $transients_after) transients removed ($transients_after left)\n"
+    return
+  fi
+  
+  if [[ $1 == '-oa' ]] || [[ $1 == '--fix-all' ]] ; then
+    current_dir="$(pwd)"
+    for i in $(find $(pwd) -iname 'wp-config.php' | sed 's/wp-config.php//g'); do 
+      echo "Repairing and Optimizing $i"
+      cd "$i"
+      wpconn wpdbrepair
+      wpconn wpdboptimize
+      return
+    done
+    cd "$current_dir"
+  fi 
+  
+  if [[ $1 == '-o' ]] ; then
+    wpconn wpdboptimize
+    return
+  fi 
+  
+  if [[ $1 == '-r' ]] ; then
+    wpconn wpdbrepair
+    wpconn wpdboptimize
+    return
+  fi
+  
+  if [[ $1 == '-s' ]] ; then
+    if [[ $2 == '-q' ]] ; then
+      wpconn "wpdbsize"
+      echo "$myconn" | awk 'END{print $0}' | \
+      awk 'NF && NF-1 {print "\tDB size:\t" ( $(NF-1) ) " MB" \
+        "\n\tDB tables:\t" ( $(NF) ) " tables"}'
+      return
+    else
+      echo
+      wpconn "wptablesize"
+      echo
+      echo "Above you will see each table's total rows and size"
+      echo -e "Below is the total amount of space used by the database.\n"
+      wpdb -s -q
+# ## removed because shared host was locking up on full size query
+#      awk 'NF && NF-4 { print "\tDB total size:  \t" ( $(NF-4) ) \
+#                            "\n\tDB data used:   \t" ( $(NF-3) ) \
+#                            "\n\tDB data free:   \t" ( $(NF-2) ) \
+#                            "\n\tDB percent used:\t" ( $(NF-1) "%" ) \
+#                            "\n\tDB total tables:\t" ( $(NF) ) " tables" }'
+      echo
+  fi
+    return
+  fi
+  
+  wpconn "wpdb"
+  if [[ $1 != "-q" ]] ; then
+    echo -e "\n
+\tDB user:\t$dbuser
+\tDB pass:\t$dbpass
+\tDB host:\t$dbhost
+\tDB name:\t$dbname
+\tDB prefix:\t$dbprefix\n"
+  fi
+  if [[ -z $myconn ]]; then
+    [[ $1 == "-q" ]] && echo -e "\tDatabase:\tPrefix?" || echo -e "Connected with no errors, but no tables that match specified prefix"!"\n"
+    # put size and tables lookups here, so if db is slow we aren't waiting forever
+    [[ $1 != "-q" ]] && wpdb -s -q && echo
+    
+  elif [[ $myconn == "ERROR"* ]]; then
+    [[ $1 == "-q" ]] && echo -e "\tDatabase:\tError"! || echo -e "$myconn\n"
+    return 9
+  else
+    [[ $1 == "-q" ]] && echo -e "\tDatabase:\tOK" || echo -e "Database connection settings appear to be fine.\n"
+    # put size and tables lookups here, so if db is slow we aren't waiting forever
+    [[ $1 != "-q" ]] && wpdb -s -q && echo
+  fi
+  if [[ $1 == "-i" ]]; then
+    if [[ -z "$2" ]]; then echo -e "No import file specified!\n"
+    elif [[ ! -f "$2" ]]; then echo -e "File '$2' does not exist!\n"
+    elif [[ "$2" == *sql ]]; then wpconn "wpdbimport" "$2"
+    elif [[ "$2" == *sql.gz ]]; then wpconn "wpdbimportgz" "$2"
+    else echo -e "'$2' is not a valid file!\n"
+    fi
+  elif [[ $1 == "-e" ]]; then
+    if [[ -n "$2" ]]; then
+      if [[ -f "$2" ]]; then echo -e "File '$2' already exists!\n"
+      elif [[ "$2" == *sql ]]; then wpconn "wpdbexport" "$2"
+      elif [[ "$2" == *sql.gz ]]; then wpconn "wpdbexportgz" "$2"
+      else echo -e "'$2' is not a valid filename!\n" && return
+      fi
+    else
+      wpconn "wpdbexport"
+    fi
+  elif [[ $1 == "drop" ]]; then
+    read -p "$(echo $'\t')Delete database? " -n 1 -r
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      echo -e "\nDropping database..."
+      wpconn "wpdbdrop"
+      [[ $myconn != "ERROR"* ]] && echo -e "Dropped database!\n" || echo -e "Failed to drop database!\n"
+    else echo -e "\tDeletion of database '$1' cancelled"!"\n"
+    fi
+  fi
+}
+
+function wpurl() {
+  if [[ $1 == "-q" ]] && [[ $2 == "--site" ]] ; then
+    wpconn "wpsiteurl" 
+    echo "$myconn" | awk 'END{print $3}'
+    return
+  fi
+  [[ $1 == "-q" ]] && wpconn "wpurl" && echo "$myconn" && return
+  echo
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "This tool returns the current URL settings in the database, or updates them to a specified URL.
+
+Usage:\twpurl [URL]
+
+\tNo options - show the current site and home urls
+
+\tURL
+\t\tspecify a URL to change the site to.
+
+\tOLDURL NEWURL
+\t\tdo a search and replace in posts for a new url.
+\t\tuseful if you moved/renamed a site's url and the 
+\t\tpictures aren't loading. We only search the posts 
+\t\tand postsmeta tables. But that should be enough for most.
+
+\t--setsite|-u [url]   set the siteurl to [url] (used for files)
+\t--sethome|-m [url]   set the homeurl to [url] (used for links)
+
+\tIf any of the above URLs do not start with 'http://' or 'https://', 
+\tit will automatically be appended with 'http://'.
+"
+    return
+  elif [[ ! -f wp-config.php ]]; then echo Could not find wp-config.php! && return 9
+  fi
+  
+  if [[ $# -eq 2 ]] ; then
+    if [[ $1 == '--setsite' ]] || [[ $1 == '-u' ]] ; then
+      # set siteurl
+      newurl=$2
+      __wpurl_check_http addfollow
+      wpconn wpsiteurlmod $newurl && echo "Updated site URL to $newurl..."
+      return
+    elif [[ $1 == '--sethome' ]] || [[ $1 == '-m' ]] ; then
+      # set home url
+      newurl=$2
+      # we don't need a trailing / on home
+      __wpurl_check_http
+      wpconn wphomeurlmod $newurl && echo "Updated home URL to $newurl..."
+      return
+    fi
+    # if they didn't match, we keep going
+  fi
+  if [[ $# -eq 1 ]] ; then
+    if [[ $1 == '--site' ]] ; then
+       # get site url
+       wpconn wpsiteurl
+       echo -en "$myconn" | awk 'END{print $3}'
+       return
+    elif [[ $1 == '--home' ]] ; then
+       # get home url
+       wpconn wphomeurl
+       echo -en "$myconn" | awk 'END{print $3}'
+       return
+    fi
+    # if they didn't match, we keep going
+  fi
+  
+  if [[ $# -eq 2 ]] ; then
+    # search and replace of url
+    newurl=$1
+    __wpurl_check_http addfollow
+    oldurl=$newurl
+    newurl=$2
+    __wpurl_check_http addfollow
+    
+    echo -e "\tStarting the siteurl/home rename process...\n"
+    echo -e "\tI recommend running a backup of your database before continuing:\n"
+    wpdb -s -q
+    echo
+    read -p "$(echo $'\t')To run a backup now with 'wpbackup db' press 'y' (N/y) " -n 1 -r
+    [[ $REPLY =~ ^[Yy]$ ]] && echo -e '\n\n' && wpbackup db -q
+    
+    echo -e "\tAre you sure you want to search and replace your posts as follows:\n"
+    echo -e "\tOld url: $oldurl"
+    echo -e "\tNew url: $newurl\n"
+    read -p "$(echo $'\t')Press y when you are sure the above is correct (N/y) " -n 1 -r
+    [[ ! $REPLY =~ ^[Yy]$ ]] && echo -e "\n\nNothing done" && return
+    echo -e "\n\nSearching and replacing. This may take some time...\n"
+    wpconn "wpurlreplace" $oldurl $newurl
+    if [[ $? -eq 0 ]] ; then
+      echo "Successfully replaced all instances of $oldurl with $newurl"
+      wpfix
+      echo "While we have tried to clear all caches, if they have a caching plugin there may be errors until the *site*'s cached files are cleared."
+    else
+      echo "Failed to replace urls in database"
+    fi
+  elif [[ -n $1 ]]; then
+    # setting 
+    oldsite="$(wpurl -q | awk '{if (NR==1) {print $3}}')"
+    newurl=$1
+    __wpurl_check_http
+    wpconn "wpurlmod" $newurl && echo "Updated home and site URLs to $newurl..."
+    # if they put it in a subfolder, the .htaccess files need updating
+    echo "Running wpht to update .htaccess rules"
+    wpht
+    
+    echo "Would you like to update your picture urls too? It will run:"
+    echo -e "\n  wpurl $oldsite $newurl\n"
+    read -p "It is recommended that you do this if your url is changed (N/y) " -n 1 -r
+    if [[ $REPLY =~ ^[Yy]$ ]] ; then
+      echo
+      wpurl $oldsite $newurl
+    else
+      echo "Clearing caches"
+      wpfix
+      echo "Skipping the replacement of picture urls. You can still run the above command yourself."
+    fi
+  elif [[ -z "$1" ]] ; then
+    wpconn "wpurl"
+    [[ -z $myconn ]] && echo -e "\thome:\tnot found\n\tsiteurl:\tnot found\n" && return
+    echo -e "$myconn" | awk '{print "\t"$2"("$1"):\t"$3}'
+  else
+    echo "Unknown option"
+  fi
+  echo
+}
+# this function checks that the url in $newurl has a http or https before it. 
+# if it does not, it adds it
+# use 'addfollow' to also add a '/' if needed
+# sets url to $newurl
+function __wpurl_check_http() {
+  [[ ! $newurl =~ https?://* ]] && newurl="http://"$newurl && echo "No 'http://' or 'https://' in provided URL" && echo -e "Using '$newurl' instead...\n"
+  if [[ "$1" == "addfollow" ]] ; then
+    newurl="$(echo $newurl | sed 's|/*$||')"
+    newurl="$newurl/"
+  fi
+}
+
+function wptheme() {
+  [[ $1 != "-q" ]] && echo
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "This tool returns the current theme, as well as listing any available ones found in the wp-content/themes folder. It also can change to a specified stylesheet, template, both, or to a new copy of twentytwelve.\n"
+    echo -e "Usage:\n"
+    echo -e "\twptheme [THEME [option]|fresh]\n"
+    echo -e "\tTHEME\n\t\tspecify a THEME for both the stylesheet and template."
+    echo -e "\tTHEME -s\n\t\tchange only the WP stylesheet"
+    echo -e "\tTHEME -t\n\t\tchange only the WP template"
+    echo -e "\tfresh\n\t\tdownload and install the 'twentytwelve' theme. \n\t\tuseful if you have no themes or only damaged ones"
+    echo
+    return
+  elif [[ ! -f wp-config.php ]]; then echo Could not find wp-config.php! && return 9
+  fi
+  folder=wp-content/themes
+  if [[ $1 == "-q" || -z $1 ]]; then
+    wpconn "wptheme"
+    if [[ $myconn == "" ]]; then echo -e "\tstylesheet:\tnot found\n\ttemplate:\tnot found"
+    elif [[ $myconn != "ERROR"* ]]; then
+      echo -e "$myconn" | tail -2 | awk '{print "\t"$2"("$1"):\t"$3}'
+    fi
+  fi
+  [[ ! -d $folder && $1 != "-q" ]] && mkdir -p $folder && echo -e "\nCreated $folder..."
+  if [[ $1 == "-q" ]]; then return
+  elif [[ -z $1 ]]; then
+    echo -e "\nAvailable themes:\n"
+    ls -F $folder |grep "/"|grep -v "^\."|sed "s|^\(.*\)/|\t\1|" #ls -A is overwritten by default $LS_OPTIONS in alias
+  elif [[ $1 == "fresh" ]]; then
+    if ! [[ -f "$folder/twentytwelve.1.1.zip" ]] ; then 
+    wget --no-check-certificate -P $folder https://wordpress.org/extend/themes/download/twentytwelve.1.1.zip && echo "Downloaded twentytwelve.1.1.zip..." || {
+      echo Unable to download twentytwelve.1.1.zip!
+      return 9
+    }
+    fi
+    # check if file was properly downloaded and not corrupt
+    echo "Verifying downloaded file..."
+    unzip -t "$folder/twentytwelve.1.1.zip" > /dev/null
+    zip_exit_code=$?
+    if [[ $zip_exit_code -ne 0 ]] ; then
+      echo -e "\nError: Downloaded file was corrupt: unzip test gave error code $zip_exit_code"
+      rm -f "$folder/twentytwelve.1.1.zip"
+      echo -e "Removed corrupt file: $folder/twentytwelve.1.1.zip"
+      echo "Try running the command again...."
+      return 9
+    else
+      echo "twentytwelve.1.1.zip appears to be okay."
+    fi
+    temp=$(now)
+    [[ -d $folder/twentytwelve ]] && mv $folder/twentytwelve $folder/twentytwelve_$temp && echo "Moved old twentytwelve files to twentytwelve_$temp..."
+    unzip $folder/twentytwelve.1.1.zip -d $folder >/dev/null && echo "Extracted new twentytwelve files..." || {
+      echo "Failed to extract twentytwelve files"!
+      return 1
+    }
+    wpconn "wpthememod" "twentytwelve" && echo "Changed to theme 'twentytwelve'..."
+    rm -f $folder/twentytwelve.1.1.zip && echo "Deleted twentytwelve.1.1.zip..."
+  else
+    [[ ! -d wp-content/themes/$1 ]] && echo -e "No such theme: $1\n" && return 1
+    if [[ $2 == "-s" ]]; then wpconn "wpthememods" $1 && echo "Changed to stylesheet '$1'..."
+    elif [[ $2 == "-t" ]]; then wpconn "wpthememodt" $1 && echo "Changed to template '$1'..."
+    elif [[ -n $2 ]]; then echo "Invalid option"!
+    else wpconn "wpthememod" $1 && echo "Changed to theme '$1'..."; fi
+  fi
+  echo
+}
+
+function wpver() {
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "
+This tool returns the current install's file and database versions.
+
+  Usage:
+
+\twpver [option]
+
+\t    -q\n\t\tdisplay abbreviated version output
+\t    -h\n\t\tdisplay this help output
+\t    --all\n\t\tprint the path and version for all wordpress installations
+"
+    return
+  fi
+  if [[ "$1" == "-a" ]] | [[ "$1" == "--all" ]]; then 
+    echo
+    for i in $(find $(pwd) -iname 'wp-config.php' | sed 's/wp-config.php//g'); do 
+      ver=`cd "$i" && wpver -q | awk '{print $1}'`
+      echo "$i -- WP Version: $ver"
+    done
+    echo
+    return
+  fi
+  local filever="Unknown"
+  local dbver="Unknown"
+  local dbver_files="Unknown"
+  [[ -f wp-includes/version.php ]] && filever=$(cat wp-includes/version.php | grep "wp_version " | sed "s/.*'\(.*\)'.*/\1/")
+  wpconn "wpdbver"
+  if [[ $? == 0 && $myconn != "ERROR"* ]]; then
+    dbver=$(echo -e "$myconn" | tail -1)
+    dbver_files=$(curl -Ss https://codex.wordpress.org/FAQ_Installation | grep "= $dbver" | head -1 | awk '{print $1}')
+  fi
+  if [[ "$1" == "-q" ]]; then echo -e "$filever $dbver $dbver_files"
+  else echo -e "\n\tWP version:\t$filever\n\tDB version:\t$dbver (up to $dbver_files)\n"
+  fi
+
+}
+
+# Shows the main logs
+# TODO: add arg to search for all error_logs,
+# but cannot use find. not good on long running servers
+function wperr() {
+  for each in "wp-admin/error_log" "error_log" ; do
+    echo
+    if [ -f "$each" ] ; then
+      if [ -s "$each" ] ; then
+        echo "==> $each <=="
+        tail "$each"
+      else
+        echo "$each is empty"
+      fi
+    else
+      echo "no $each was found"
+    fi
+    echo "--"
+  done
+  # TODO: search for other error logs.
+}
+    
+
+function wpuser() {
+  [[ $1 != "-q" ]] && echo
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "This tool performs various user functions, including returning info for a specified user, changing usernames, passwords, changing a user to an admin, creating new admin users, and deleting users.\n"
+    echo -e "Usage:\n"
+    echo -e "\twpuser [param [option [param]]]\n"
+    echo -e "\tUSERID\n\t\tReturns details about specified user USERID"
+    echo -e "\tUSERID -u NAME\n\t\tchange username of user USERID to NAME"
+    echo -e "\tUSERID -p PASS\n\t\tchange password of user USERID to PASS"
+    echo -e "\tUSERID -a\n\t\tpromote user USERID to admin"
+    echo -e "\tUSERID -d\n\t\tdelete user USERID"
+    echo -e "\tUSERID -l, login\n\t\tmake login/access link for user USERID"
+    echo -e "\t        -> this is easier and faster than making a user"
+    echo -e "\t        -> you can also just run 'wplogin' as a shortcut"
+    echo -e "\t-n, new\n\t\tcreate new admin user"
+    echo -e "\tall\n\t\tlist all users"
+    echo -e "\tadmins\n\t\tlist all admins\n"
+    return
+  elif [[ ! -f wp-config.php ]]; then echo Could not find wp-config.php! && return 9
+  fi
+  if [[ -z $1 ]]; then wpconn "wpuser"				#list users
+  elif [[ $1 == "-q" ]]; then wpconn "wpuser1"			#list first user
+  elif [[ $1 =~ ^[0-9]+$ ]]; then				#if a number...
+    if [[ $2 == "-p" ]]; then					  #change password...
+      if [[ -n $3 ]]; then wpconn "wpuserp" $1 "$3"		    #...if one is specified...
+      else echo -e "\tNo password specified"!"\n" && return 1; fi   #...otherwise, end.
+    elif [[ $2 == "-u" ]]; then					  #change username...
+      if [[ -n $3 ]]; then wpconn "wpuseru" $1 "$3"		    #...if one is specified...
+      else echo -e "\tNo username specified"!"\n" && return 1; fi   #...otherwise, end.
+    elif [[ $2 == "-a" ]]; then wpconn "wpusera" $1	 	  #change to admin
+    elif [[ $2 == "-d" ]]; then read -p "$(echo $'\t')Delete user '$1'? " -n 1 -r && echo && [[ ! $REPLY =~ ^[Yy]$ ]] && echo -e "\tDeletion of user '$1' cancelled"!"\n" && return 1 || wpconn "wpuserd" $1	 	  #delete user
+    elif [[ $2 == "-l" || $2 == "--login" || $2 == "login" ]]; then __wp_create_access_file $1 ; myconn=1   # create login link to get cookie
+    elif [[ -z $2 ]]; then wpconn "wpuserinfo" $1		  #show user info
+    else echo -e "\tInvalid option"!"\n" && return 1; fi		  #Otherwise, end.
+  elif [[ $1 == "new" || $1 == "-n" ]]; then wpconn "wpusernew"		#create new admin...
+  elif [[ $1 == "all" ]]; then wpconn "wpuserall"		#show all users...
+  elif [[ $1 == "admins" ]]; then wpconn "wpuseradmins"		#show admins...
+  else echo -e "\tInvalid option"!"\n" && return 1; fi		#Otherwise, end.
+  if [[ $myconn == "" ]]; then echo -e "\tUser not found"!
+  elif [[ $myconn != "ERROR"* ]]; then
+    if [[ -z $1 ]]; then  
+      echo -e "\t(only showing upto 23 users. To see all use 'wpuser all')\n"
+      echo -e "$myconn" | awk '{print "\t"$1":\t"$2}'
+    elif [[ $1 == "all" ]]; then echo -e "$myconn" | awk '{print "\t"$1":\t"$2}'
+    elif [[ $1 == "admins" ]]; then echo -e "\tAdmins:\n";echo -e "$myconn" | awk '{print "\t"$1":\t"$2}'
+    elif [[ $1 == "-q" ]]; then echo $(echo -e "$myconn" | tail -1)
+    elif [[ $2 == "-p" ]]; then echo -e "Updated password for user $1 ('$(echo -e "$myconn" | tail -1)') to '$3'..."
+    elif [[ $2 == "-u" ]]; then echo -e "Updated username for user $1 from '$(echo -e "$myconn" | tail -1)' to '$3'..."
+    elif [[ $2 == "-a" ]]; then echo -e "Promoted user $1 to admin..."
+    elif [[ $2 == "-d" ]]; then echo -e "\nDeleted user $1 ('$(echo -e "$myconn" | tail -1)')..."
+    elif [[ $1 == "new" || $1 == "-n" ]]; then echo -e "Created new admin (user '$(echo -e "$myconn" | tail -1)') with username 'deleteme'\n\n and password '$deleteme_pass'...\n\nMake sure to delete or rename this user"!
+    elif [[ -z $2 ]]; then echo -e "$myconn"
+    fi
+  else echo "$myconn"
+  fi
+  [[ $1 != "-q" ]] && echo
+  
+  # find and remove old access links
+  if [[ -z $show_access_link_warning ]] ; then
+   if [[ -z $1 || $1 == "new" || $1 == "all" || $1 == "admins" ]] ; then
+    list_of_files="$(ls make-pass-*.php access-link-*.php 2>/dev/null)"
+    if [[ -n "$list_of_files" ]] ; then
+      access_files=""
+      # verify each file so we don't remove the wrong ones
+      # look for the string "this file is to give admin access"
+      for each in $list_of_files ; do
+        if [[ $(grep "this file is to give admin access" $each) ]] ; then
+          access_files="$each ${access_files}"
+        fi
+      done
+      if [[ -n $access_files ]] ; then
+        echo --------------------------
+        echo Warning: there are Access Link files. These may be the files
+        echo that we use to access the Dashboard of the site. 
+        echo " ------ They probably should be removed ------"
+        ls $access_files
+        echo
+      fi
+      read -p "$(echo $'\t')Would you like to remove these Access Link files? (y/N) " -n 1 -r
+      if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rm -f make-pass-*.php access-link-*.php
+        if [[ -n "$(ls make-pass-*.php 2>/dev/null)" || -n "$(ls access-link-*.php 2>/dev/null)" ]] ; then
+          echo -e "\nFailed to remove the files. Maybe there is a permissions issue?"
+        else
+          echo -e "\nRemoved access links"
+        fi
+      else
+        echo -e "\n\nYou won't be prompted again, unless you run: show_access_link_warning=''"
+        show_access_link_warning=done
+      fi
+      echo
+    fi
+   fi
+  fi
+}
+
+# creates a access link for the first admin user it finds
+function wplogin() {
+  wpconn "wpuseradmins"
+  if [[ -z "$myconn" ]] ;then
+    echo "We either failed to connect to the database or you have no admins on this site."
+    return
+  elif [[ $myconn == "ERROR"* ]]; then
+    "Error connecting to the database: $myconn"
+    return
+  fi
+  # __admin_id="$(echo -e $myconn | tail +1 | awk 'NF-1 {print ( $(NF-1) )}')"
+  # changed from if (NR==1) {print $3} to if (NR==1) {print $1}.
+  __admin_id="$(echo $myconn | awk '{if (NR==1) {print $1}}')"
+  # check that it is a number
+  case $__admin_id in
+    ''|*[!0-9]*) 
+      # not a number 
+      echo "Error: I was not able to get the id of any admins."
+      echo "Try 'wpuser admins' and wpuser # -l"
+      echo "(ID number returned: $__admin_id)"
+      return 9
+      ;;
+    *) 
+      echo -e "\nUsing admin with ID $__admin_id"
+      wpuser $__admin_id -l
+      ;;
+  esac
+  
+}
+
+function __wp_create_access_file() {
+
+# get and verify user
+u=$1
+if [ -n "$(wpuser $u | grep 'User not found')" ] ; then
+  # Just warn for now, until we test it better
+  echo "**** Warning, I think that user does not exist ****"
+  echo "  But if it does, please report this as a bug."
+  echo ".... Continuing anyways ...."
+  echo
+fi
+
+# Checks
+testsite="$(wpurl)"
+if [[ -z $testsite ]] ; then
+  echo "Error. I got an blank back for the site name"
+  wpstats
+  return 9
+fi
+
+# Get site
+site="$(wpurl -q --site)"
+# Remove last /
+site="$(echo $site | sed 's|/*$||')"
+
+# this will be the file name
+# TODO: use tmpfile if available
+__wp_rand_string 16
+st="$wp_rand_string"
+tmp_php_file="access-link-${st}.php"
+
+trap "rm -f \"$tmp_php_file\" ; echo The file was removed. ; trap - 0 1 2 3 15 ; return" 0 1 2 3 15
+
+__wp_rand_string 10
+pass="$wp_rand_string"
+
+# be sure to escape all php $vars or bash will try to use them
+# except for $u, as that is the user id
+cat > "$tmp_php_file" <<EOF
+<?php
+// this file is to give admin access
+// you can remove it at any time
+// remove on run - even if they fail the pass below
+class DeleteOnExit
+{
+    function __destruct()
+    {
+      if ( file_exists(__FILE__) ) {
+        unlink(__FILE__);
+      }
+    }
+}
+\$g_delete_on_exit = new DeleteOnExit();
+if ( ! isset (\$_GET['z']) 
+        or empty(\$_GET['z']) 
+        or strcmp ( \$_GET['z'], '$pass' ) ) {
+  echo 'Forbidden';
+  exit;
+}
+
+// load wp libs
+require_once( './wp-load.php' );
+
+// cannot check as we do not have cookie
+// but left it here so to remember
+//if ( !current_user_can('admin') ) {
+  
+// gen and set auth cookies
+wp_set_auth_cookie($u);
+
+// redirect
+// do not test for redirect, as 'user_can' is only >3.5
+//if ( user_can($u,'switch_themes') ) {
+wp_redirect( admin_url() );
+
+// just to be safe
+if ( file_exists(__FILE__) ) {
+  unlink(__FILE__);
+}
+EOF
+
+echo "Go to this link to get your login cookies:"
+echo 
+echo "$site/$(basename $tmp_php_file)?z=$pass"
+echo "
+This is a one time use only link. Make sure you use/copy it right.
+Most terminals allow you to click on the link to open it.
+
+Also, pressing enter here will remove it.
+After 60 seconds I will remove it, even if you don't press enter."
+echo
+x=20
+READ=""
+while [[ $x -gt 0 && -z $READ && -f "$tmp_php_file" ]] ; do
+ read -t 3
+ read_code=$?
+ [[ $read_code -eq 0 ]] && READ="ok"
+ # echo $read_code
+ x=$(($x - 1))
+done
+if ! [[ -f "$tmp_php_file" ]]; then
+  echo "File removed itself."
+else
+  [ -f "$tmp_php_file" ] && rm -f "$tmp_php_file"
+  if [ $? -eq 0 ] && ! [ -f "$tmp_php_file" ] ; then
+    echo "The file was removed."
+  else
+    echo "ERROR: Failed to remove temp file $tmp_php_file"
+  fi
+fi
+
+trap - 0 1 2 3 15
+
+}
+
+
+function wpplug() {
+  echo
+  
+  # only set plugins folder if not set. This will allow us to use custom folder locations
+  [[ -z "$wpt_plugins_folder" ]] && wpt_plugins_folder="wp-content/plugins"
+  
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "This tool does basic plugin functions, such as displaying active and available plugins, or disabling them.
+Usage: wpplug [disable <plugin>|disable-all|restore-all|disable-all-via-folder]
+
+\t[no option]
+\t\tshow a list of enabled plugins and all plugins installed
+
+\t-d, disable [plugin]
+\t\tdisable selected plugin in the database, by its folder name
+\t\thint: list all the plugins, and you'll see it in there.
+
+\tdisable-all, --da
+\t\tdisable all plugins in the database (safer method)
+
+\trestore-all, --ra
+\t\trestore the plugins that were active before, as disable-all
+\t\tsaves them to \$wpt_disabled_plugins. Of course it's only 
+\t\tvalid for this session.
+
+\tdisable-all-via-folder
+\t\tdisable all plugins by renaming pluging folder 
+\t\t(warning! may cause data loss)
+"
+    return
+  elif [[ ! -f wp-config.php ]]; then echo Could not find wp-config.php! && return 9
+  fi
+  if [[ $1 =~ ^[-]*da$ ]] || [[ $1 =~ ^[-]*disable-all$ ]] ; then
+    # get current plugins
+    wpconn "wpplug"
+    if [[ $myconn == "ERROR"* ]]; then 
+      echo "There was a database error: $myconn"
+      return 9
+    fi
+    wpt_disabled_plugins=$(echo "$myconn")
+    if [[ -z "$wpt_disabled_plugins" ]] ; then
+      echo "Failed to get a list of plugins... or is active_plugins empty?"
+      echo "Nothing done"
+      return 9
+    else
+      # disable all
+      wpconn "wpplugdisableall" && echo "Disabled all plugins" || echo "Failed to disable plugins"
+      echo "You may want to copy the following code, in case your shell closes:"
+      echo
+      echo $wpt_disabled_plugins
+      echo
+      return
+    fi
+  
+  elif [[ $1 =~ ^[-]*ra$ ]] || [[ $1 =~ ^[-]*restore-all$ ]] ; then
+    if [[ -z "$wpt_disabled_plugins" ]] ; then
+      echo "There is nothing saved in \$wpt_disabled_plugins"
+      echo "Are you sure you disabled itFailed to get a list of plugins... or is active_plugins empty?"
+      echo "Nothing that I can do... exiting."
+      return 9
+    else
+      wpconn "wpplugrestoreall" && echo "Restored all plugins" || echo "Failed to restore plugins"
+      return
+    fi
+    
+  elif [[ $1 =~ ^[-]*disable-all-via-folder$ ]]; then
+    if [[ ! -d $wpt_plugins_folder ]]; then 
+      echo "The plugins folder $wpt_plugins_folder was not found"!
+      echo "Try setting wpt_plugins_folder=path/to/plugins"
+      echo "Currently it is set to: $wpt_plugins_folder"
+      return 9
+    fi
+    temp=$(now)
+    mv $wpt_plugins_folder "$wpt_plugins_folder"_$temp && echo "Moved plugins to $wpt_plugins_folder"_$temp...
+  
+  elif [[ $1 =~ ^[-]*disable$ ]] || [[ $1 == "-d" ]] && [[ -n $2 ]]; then
+    __wpt_disable_plugin $2
+    
+  elif [[ -z $1 ]]; then
+    if [[ ! -d $wpt_plugins_folder ]]; then 
+      echo "The plugins folder $wpt_plugins_folder was not found"!
+      echo "Try setting wpt_plugins_folder=path/to/plugins"
+      echo "Currently it is set to: $wpt_plugins_folder"
+      return 9
+    fi
+    echo -e "Active plugins:\n"
+    wpconn "wpplug"
+    if [[ $myconn == "ERROR"* ]]; then 
+      echo "There was a database error: $myconn"
+      return 9
+    fi
+    active=$(echo "$myconn")
+    #__wpt_which_tool php-cli php
+    #$php_cli=$found_tool
+    __wpt_get_php_inline
+    $wpt_php -r "print_r(unserialize('$active'));" 2>/dev/null | grep "=>" | sed "s|.*=> \(.*\)|\t\1|"
+    echo
+    echo -e "Available plugins:\n"
+    ls -F $wpt_plugins_folder |grep "/"|grep -v "^\."|sed "s|^\(.*\)/|\t\1|" #ls -A is overwritten by default $LS_OPTIONS in alias
+  else
+    echo "Unknown option(s): $@"
+    wpplug -h
+  fi
+  echo
+}
+
+function __wpt_disable_plugin() {
+  plugin_remove=$1
+  # take only the folder if a path was given
+  # ie 'autoptimize' vs 'autoptimize/autoptimize.php'
+  if [ -n "$(echo $plugin_remove | grep '/')" ] ; then
+    #echo "warning, a path was given for the plugin name... fixing."
+    plugin_remove="$(echo $plugin_remove | cut -f1 -d'/')"
+  fi
+  if [[ -z $plugin_remove ]] ; then
+    echo "__wpt_disable_plugin: No plugin given"
+    return 9
+  fi
+  wpconn "wpplug"
+  if [[ $myconn == "ERROR"* ]]; then 
+      echo "There was a database error: $myconn"
+      return 9
+  fi
+  active=$(echo "$myconn")
+#    php -q <<"EOF"
+#    <?php
+#      \$plugin_list=unserialize('\'$active');
+#      \$remove_index = array_search('test', \$plugin_list);
+#      unset(\$plugin_list[\$remove_index]);
+#      printr(serialize(\$plugin_list));
+#    ?>
+#EOF
+  #active_noquot="$(echo $active | sed 's/"/\\"/g')"
+  #plugin_noquot="$(echo $2 | sed 's/"/\\"/g')"
+  #__wpt_which_tool php-cli php
+  #$php_cli=$found_tool
+  __wpt_get_php_inline
+  now_active=$($wpt_php -r "\$plugin_list=unserialize('"$active"');
+  // remember that $plugin_remove is not escaped, as we are subing it in
+  \$plugin_list=preg_grep ( '/^"$plugin_remove"\/.*/' , \$plugin_list, PREG_GREP_INVERT);
+  // the long way, but kept just in case
+  //  foreach (\$plugin_list as \$k => \$p) {
+  //    if ( preg_match('/"$plugin_remove"\/.*/', \$p) == TRUE ) {
+  //      unset(\$plugin_list[\$k]);
+  //    }
+  //  }
+  print_r(serialize(\$plugin_list));")
+  
+  # check it
+  if [ -z $now_active ] ; then
+    echo "Failed to parse plugin data (__wpt_disable_plugin). Nothing done."
+    return 9
+  fi
+  if [ -n "$(echo $now_active | grep "$plugin_remove/")" ] ; then
+    echo "Warning, the plugin may have not been removed"
+  fi
+  
+  wpconn wpplugset $now_active
+  if [[ $myconn == "ERROR"* ]]; then 
+      echo "There was a database error: $myconn"
+      return 9
+  fi
+  echo "Successfully deactivated $plugin_remove"
+}
+
+# This function detects if we should use php-cli or php for the -r arg
+# (and clear out wpt_php var, in case it was set wrong)
+wpt_php=""
+function __wpt_get_php_inline() {
+  [[ -n "$wpt_php" ]] && return
+  # detect which php can run with -r (inline)
+  php-cli -r "\$test=1; \$test2=2;" >/dev/null 2>&1
+  if [ $? -eq 0 ] ; then
+    wpt_php="php-cli"
+  else
+    php -r "\$test=1; \$test2=2;"
+    if [ $? -eq 0 ] ; then
+      wpt_php="php"
+    else
+      echo "Warning, I was unable to detect which php can run with -r (inline). Setting it to 'php-cli'. Set wpt_php= to override"
+      wpt_php="php-cli"
+    fi
+  fi
+}
+
+function __wpt_disable_plugin_last() {
+echo none;
+} 
+
+
+function __wpt_which_tool() {
+  fallback=$1
+  found_tool=""
+  for tool in $* ; do
+    for each in $(echo $PATH | sed 's/:/ /g') ; do
+      if [[ $found_tool == "" ]] ; then
+        if [[ -f "$each/$tool" ]] || [[ -L "$each/$tool" ]] ; then
+          found_tool=$each/$tool
+        fi
+      fi
+    done
+  done
+  if [[ $found_tool == "" ]] ; then
+    found_tool=$fallback
+  fi
+}
+
+
+function wptests() {
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "This tool does basic tests on the install.\n"
+    echo -e "Usage:\n"
+    echo -e "\twptests [param [option param]]\n"
+    echo -e "\tall\n\t\ttests each item in wp-content/plugins on the server\n"
+    echo -e "\tall --url URL\n\t\ttests HTTP status code for each item in wp-content/plugins at specified url URL\n"
+    return
+  elif [[ ! -f wp-config.php ]]; then echo Could not find wp-config.php! && return 9
+  fi
+  if [[ $2 == "--url" && -n $3 ]]; then status=$(curl -sIL -o /dev/null -w "%{http_code}\n" $3)
+  else status=$(php index.php >/dev/null && php wp-admin/index.php >/dev/null; echo $?); fi
+  [[ $1 == "-q" ]] && echo $status && return
+  echo
+  [[ $status != "255" && $status != "500" ]] && echo -e "No errors detected..." || echo -e "500 error on page"!
+  echo
+  [[ -z $1 ]] && return
+  [[ $1 == "all" ]] && folders="wp-content/plugins" || folders=$(echo $1|sed "s|/$||g")
+  temp=$(now)
+  if [[ $2 == "--url" && -n $3 ]]; then echo -e "*** NOTE: This test doesn't confirm items are fully functional; it simply checks the status code on '$3'. DO NOT INTERRUPT! ***\n"
+  else echo -e "*** NOTE: This test doesn't confirm items are fully functional; it simply tries to run index.php and wp-admin/index.php in the local shell. DO NOT INTERRUPT! ***\n"; fi
+  temp=$(now)
+  for f in $folders; do
+    [[ ! -d $f ]] && echo "The folder '$f' was not found"! && continue
+    echo "Testing $f..."
+    mv $f "$f"_$temp && echo "Moved $f to $f"_$temp...
+    mkdir $f && echo "Created new $f folder..."
+    status=$(wptests -q --url $3); [[ $status == "255" || $status == "500" ]] && echo "Renaming the $f folder results in a 500 error...errors below MAY be safe to ignore"! || echo "Renaming the $f folder appears to result in no error..."
+    for i in "$f"_$temp/*; do
+      [[ -f $i ]] && continue
+      plugin=${i##*/}
+      mv "$f"_$temp/$plugin $f && echo -e "\tTesting ${f%?} '$plugin'..." $(
+        status=$(wptests -q --url $3)
+        if [[ $status == "200" || $status == "0" ]]; then echo "OK"
+        elif [[ $status == 255 ]]; then echo "500"
+        else echo $status; fi
+      ) && mv $f/$plugin "$f"_$temp
+    done
+    mv "$f"_$temp/* $f && echo "Moved $f back to original folder..." && rm -rf "$f"_$temp && echo "Removed $f"_$temp...
+  done
+  echo
+}
+
+
+function __wp_continue_or_done() {
+  [[ -n $1 ]] && __msg="$1 test" || __msg="tests"
+  if [[ -n $2 ]] ; then
+    read -p "$(echo $'\n\t')$2 (y/N)? " -n 1 -r
+  else
+    read -p "$(echo $'\n\t')Would you like to [Y] continue with the ${__msg}? (y/N)? " -n 1 -r
+  fi
+  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo -e "\nExiting..."
+    return 0
+  fi
+  return 1
+}
+
+function wptrace() {
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "This tool uses strace to show what may be causing a wsod.\n"
+    echo -e "Usage: wptrace [[err]|file.php]\n"
+    echo -e "\tWith no options\n\t\t Run full trace on index.php\n"
+    echo -e "\terr\n\t\t Only show usual errors\n"
+    echo -e "\t[err] file.php\n\t\t Run strace on file.php\n"
+    return
+  elif [[ ! -f wp-config.php ]]; then echo Could not find wp-config.php! && return 9
+  fi
+  
+  file="./index.php"
+  if [[ $# -eq 1 && "$1" != "err" ]] ; then
+    if [[ -f "$1" ]] ; then
+      file="$1"
+    else
+      ehco "Could not find $1"
+    fi
+  elif [[ $# -eq 2 ]] ; then
+    if [[ -f "$2" ]] ; then
+      file=$2
+    else
+      echo "Could not find $2"
+    fi
+  fi
+  
+  if [[ "$1" == "err" ]] ; then
+    strace php -f "$file" 2>&1 | egrep -i '(No such file or directory|error|warn)'
+  else
+    strace php -f "$file"
+  fi
+  
+  echo -e "
+\tDone tracing $file.
+\tThe above output is to help give you an *idea* of what may be hurting
+\tthe site. Read it from bottom to top, as the errors that are stopping
+\tit usually are at the bottom. Keep in mind that it is
+\tnormal to see many errors above.
+
+\tTry looking for missing theme or plugins files, but note that child themes
+\talways are missing files.\n"
+
+}
+
+
+function wpscan() {
+  if [[ -z $1 || $1 == "--help" || $1 == "-h" ]]; then
+    if [[ $2 == "strings" ]] ; then
+      # wpscan -h strings
+      echo -e "wpscan uses strings to find bad files, which it loads by default.
+Usage: wpscan [show-strings|default-strings|add-strings|clear-strings]
+
+\tshow-strings
+\t\tShow a list of the scan strings that are currently loaded.
+
+\tdefault-strings [devel|alpha]
+\t\tOptional method to set the strings back to the default list.
+\t\tOptionally specify devel or alpha to use newer(?) string lists.
+
+\tYou may also override the strings with your own set(s).
+
+\textra_strings='string1\\\nstring2\\\nstring3'
+\t\tInclude your own strings in the scan by setting them to the 
+\t\t\$extra_strings variable. Use ' and separate each with a '\\\n'
+
+\tadd-strings http(s)://domain.com/stringsfile
+\t\tLoad your own strings from a file at the given address. 
+\t\tDefault strings are not be added if you do this first.
+
+\tclear-strings
+\t\tClear out all scan strings"
+      
+      return
+    else
+      # wpscan -h
+      echo -e "This tool scans for strings that are in typical malware.\n
+Usage: wpscan [quick|full]\n\t\t\n
+\tquick
+\t\t Scans the core files, plugins, and themes.\n
+\tfull
+\t\t Scans all files in the current directory and down.\n
+\t[quick|full|rquick] quiet
+\t\t Only show the actual phrase matched. Not the whole line.\n
+
+\tYou can use your own list of strings to search for.
+\tSee 'wpscan -h strings' for instructions on how to do so.
+
+\tNote! Scanning can take a huge amount of cpu and disk drive.
+\tIf you abuse your provider's resources, they may shut you down."
+      echo
+      return
+    fi
+  fi
+  
+  # manage string list
+  # show strings
+  if [[ $1 == "show-strings" ]] ; then
+    __wpscan_show_strings
+    return
+  
+  # clear strings  
+  elif [[ $1 == "clear-strings" ]] ; then
+    scan_strings=""
+    echo "Scan strings cleared:"
+    __wpscan_show_strings
+    return
+    
+  # add strings
+  elif [[ $1 == "add-strings" ]] ; then
+    if [[ -z $2 ]] ; then
+      echo "No url was specified"
+      return 9
+    fi
+    __wpscan_get_strings $2 || return 9
+    # we add it differently if there's already data in it
+    if [[ -n $scan_strings ]] ; then
+      scan_strings="$(echo -e "$scan_strings\n$get_strings")"
+    else
+      scan_strings="$(echo -e "$get_strings")"
+    fi
+    __wpscan_show_strings
+    echo "Strings successfully added"
+    return
+    
+  # default strings
+  elif [[ $1 == "default-strings" ]] ; then
+    __wpscan_get_strings $2 || return 9
+    scan_strings=$get_strings
+    echo "Default scan strings loaded"
+    # __wpscan_show_strings
+    # echo "Default scan strings loaded"
+    return
+    
+  # if this is a scan and the scan string is empty, load it.
+  elif [[ $1 == "full" || $1 == "quick" || $1 == "list" || $1 == "pics" ]] || \
+    [[ $1 == "rquick" ]] || [[ $1 == "quickall" ]] ; then
+    if [[ -z $scan_strings ]] ; then
+      __wpscan_get_strings $2 || return 9
+      scan_strings=$get_strings
+      [[ $2 != "script" ]] && echo "Default scan strings loaded"
+    fi
+    
+  else
+    echo "Unknown option. Try 'wpscan -h'"
+    return 9
+  fi
+  
+  # add extra strings if variable is set
+  if [[ -n "$extra_strings" ]] ; then
+    [[ $2 != "script" ]] && echo "The variable \$extra_strings is set. Adding strings..."
+    scan_strings="$(echo -e "$scan_strings\n$extra_strings")"
+    extra_strings=""
+  fi
+  
+  # verify we got $scan_strings
+  if [[ -z $scan_strings ]] ; then
+    echo "No scan strings were not loaded. I can't continue without them"
+    return 9
+  fi
+  #__wpscan_show_strings
+  
+  [[ $2 != "script" ]] && echo -e "
+\tNote! Scanning can take a huge amount of cpu and disk drive.
+\tIf you abuse your provider's resources, they may shut you down.
+\tScanning for malware is an advanced topic and requires that
+\tyou know php code, and what is good code and what is bad code.
+\tSo PLEASE realize that you may be presented with files that
+\tare not actually hacked, or just need to be cleaned. 
+\t  So either know what you are doing, or go buy a product.\n"
+
+#  read -p "$(echo $'\t')Do you understand what you are doing and want to proceed? (N/y)? " -n 1 -r
+#  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+#    echo -e "\nExiting..."
+#    return
+#  fi
+  
+  quiet=''
+  if [[ "$2" == "quiet" ]] ; then
+    quiet='o'
+  fi
+  
+  # .php can be '*\.php*' or \*\.php\*
+  
+  if [[ $1 == "quick" ]] ; then
+    [[ $2 != "script" ]] && echo -e "\n\n\tStarting quickscan...\n"
+    if [[ $quiet == 'o' ]] ; then
+      LC_ALL=C fgrep -F -ilr$quiet --include  '*\.php*' "$scan_strings" *.php \
+        "$(pwd)/wp-admin" "$(pwd)/wp-content" "$(pwd)/wp-includes"
+    else
+      LC_ALL=C fgrep -F -ir$quiet --color=always --include  '*\.php*' "$scan_strings" *.php \
+        "$(pwd)/wp-admin" "$(pwd)/wp-content" "$(pwd)/wp-includes" | cut -c1-200
+    fi
+  
+  elif [[ $1 == "rquick" ]] || [[ $1 == "quickall" ]] ; then
+    [[ $2 != "script" ]] && echo -e "\n\n\tStarting recursive quickscan...\n"
+    if [[ $quiet == 'o' ]] ; then
+      LC_ALL=C fgrep -F -ilr$quiet --include '*\.php*' "$scan_strings" "$(pwd)"
+    else
+      LC_ALL=C fgrep -F -ir$quiet --color=always --include '*\.php*' "$scan_strings" "$(pwd)" | cut -c1-200
+    fi
+  elif [[ $1 == "full" ]] ; then
+    echo -e "\n\n\tStarting full scan...\n"
+    if [[ $quiet == 'o' ]] ; then
+      LC_ALL=C fgrep -F -ilr$quiet "$scan_strings" "$(pwd)"
+    else
+      LC_ALL=C fgrep -F -ir$quiet --color=always "$scan_strings" "$(pwd)"  | cut -c1-200
+    fi
+    #LC_ALL=C grep -a -F -n -r -f ./search-strings.txt $(pwd) | cut -c1-200
+  
+  elif [[ $1 == "list" ]] ; then
+    echo -e "\n\n\tGenerating List...\n"
+    if [[ $quiet == 'o' ]] ; then
+      LC_ALL=C fgrep -F -ilr$quiet "$scan_strings" $(pwd)
+    else
+      LC_ALL=C fgrep -F -ilr$quiet "$scan_strings" $(pwd) | cut -c1-200 | sort | uniq
+    fi
+    #LC_ALL=C grep -a -F -n -r -f ./search-strings.txt $(pwd) | cut -c1-200 | sed 's/:/ /g' | awk '{print $1}' | sort | uniq
+
+  elif [[ $1 == "pics" ]] ; then
+    echo -e "\n\n\tStarting picture scan...\n"
+    if [[ $quiet == 'o' ]] ; then
+      LC_ALL=C fgrep -F -ilr$quiet --include "*.jpg" --include "*.jpeg" \
+          --include "*.png" --include "*.bmp" --include "*.gif" '<?php' "$(pwd)"
+    else
+      LC_ALL=C fgrep -F -ir$quiet --color=always  --include "*.jpg" --include "*.jpeg" \
+          --include "*.png" --include "*.bmp" --include "*.gif" '<?php' "$(pwd)" | cut -c1-200
+    fi
+    
+  else
+    echo "Invalid option. Try 'wpscan -h'"
+  fi
+  
+  # check for an index.html with the word "hacked" in it
+  for each in index.html index.php lndex.php ; do
+    if [[ -f "$each" ]] ; then
+      if [[ -n "$(egrep -i '(hacked|h@cked|pwned)' $each)" ]] ; then
+        echo
+        echo "* Warning: There is an $each file with the word(s) 'hacked/h@cked/pwned' in it. Advise you check it out"
+        echo
+      fi
+    fi
+  done
+  
+  # check for any php files in uploads
+  if [[ -n "$(find wp-content/uploads/{1,2,3}* -name '*.php' 2>/dev/null)" ]] ; then
+    echo
+    echo "There are php files in the uploads folder. You should investigate this:"
+    echo
+    find wp-content/uploads/{1,2,3}* -name '*.php' 2>/dev/null
+  fi
+  
+  [[ $2 != "script" ]] && echo -e "\nScan Finished."
+}
+
+function __wpscan_show_strings() {
+  echo -e "\n==== Using the following for scan strings:\n$scan_strings\n==== End scan strings\n"
+}
+
+function __wpscan_get_strings() {
+  if [[ -z $1 ]] || [[ $1 == "script" ]] ; then
+    [[ $1 != "script" ]] && echo "Downloading the default strings..."
+    get_strings="$(curl -Ssf https://raw.githubusercontent.com/bagley/wptool/master/scanstrings)"
+  
+  elif [[ $1 == "devel" ]] ; then
+    echo "Downloading the devel strings..."
+    get_strings="$(curl -Ssf https://raw.githubusercontent.com/bagley/wptool/devel/scanstrings)"
+    
+  elif [[ $1 == "alpha" ]] ; then
+    echo "Downloading the alpha strings..."
+    get_strings="$(curl -Ssf https://raw.githubusercontent.com/bagley/wptool/alpha/scanstrings)"
+
+  else
+    echo "Downloading strings from $1"
+    get_strings="$(curl -Ssf $1)"
+  fi
+  if [[ -z $get_strings ]] ; then
+    echo "Failed to get scan strings"
+    echo "We didn't get any output, which means there was an error."
+    return 9
+    
+  elif [[ $get_strings == "Not Found" ]] ; then
+    echo "File was not found"
+    return 9
+  
+  fi
+}
+
+
+function wpbackup() {
+  if [[ -z $1 || $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "This tool creates a backup of the databases and/or wp-content folders\n"
+    echo -e "Usage:\n"
+    echo -e "\twpbackup [files|db|all]\n"
+    echo -e "\twpbackup\n\t\t Shows help, in case nb runs on 500G db w/o reading first.\n"
+    echo -e "\twpbackup files\n\t\t Makes a backup of files.\n"
+    echo -e "\twpbackup db|database\n\t\t Makes a backup of the database.\n"
+    echo -e "\twpbackup all\n\t\t Makes a backup of database and files.\n"
+    echo
+    return
+  elif [[ ! -f wp-config.php ]]; then echo Could not find wp-config.php! && return 9
+  fi
+  
+  if [[ "$1" == "db" || "$1" == "database" ]] ; then
+    # do database
+    if [[ $2 != '-q' ]] ; then
+      echo
+      wpdb -s -q
+      echo
+    fi
+    wpconn wpdbexportgz
+  elif [[ "$1" == "files" ]] ; then
+    # files
+    __wp_backup_files
+  elif [[ "$1" == "all" ]] ; then
+    # db and files
+    if [[ $2 != '-q' ]] ; then
+      echo
+      wpdb -s -q
+      echo
+    fi
+    wpconn wpdbexportgz
+    __wp_backup_files
+  fi
+}
+
+function __wp_rand_string() {
+  length=20
+  [[ -n "$1" ]] && length=$1
+  wp_rand_string="$(tr -dc A-Za-z0-9_ < /dev/urandom | head -c $length | xargs)"
+  # double check
+  
+  if [[ -z "$wp_rand_string" || ${#wp_rand_string} -lt $length ]] ; then
+    wp_rand_string="$(cat /dev/urandom | base64 -w 0 | head -c$length | sed 's/[\/\+\s \n\r]/_/g')"
+  fi
+  
+  if [[ -z "$wp_rand_string" || ${#wp_rand_string} -lt $length ]] ; then
+    x=0
+    while [[ ${#wp_rand_string} -lt $length && $x -lt $length ]] ; do
+      wp_rand_string="$wp_rand_string$RANDOM"
+      x=$(($x + 1))
+    done
+  fi
+  
+  if [[ -z "$wp_rand_string" || ${#wp_rand_string} -lt $length ]] ; then
+    echo "Warning. Failed to get a random string. Here's some nanoseconds."
+    wp_rand_string="$(now)-$(date +%N)"
+    return 9
+  fi
+}
+
+function __wp_backup_files() {
+  __wp_rand_string
+  echo "Compressing files..."
+  file="wp-content-backup-$(now)-$wp_rand_string.tar.gz"
+  tar czf "$file" wp-content wp-config.php
+  if [ $? -eq 0 ] ; then
+    echo "Done. Saved files to $file"
+  else
+    echo "Failed to save files"
+    rm -f "$file"
+  fi
+}
+
+function wprestore() {  
+  if [[ -z $1 || $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "This tool restores the database from a backup file. It requires that wp-config.php be installed with the correct credentails.\n"
+    echo -e "Usage:\n"
+    echo -e "\twprestore db <file>\n\t\t Restores from a regular .sql/.sql.gz file.\n"
+    echo -e "\twprestore forcedb <file>\n\t\t Restores from a sql file w/o checking it's type.\n"
+    echo -e "\twprestore forcegz <file>\n\t\t Restores from a sql.gz file w/o checking it's type.\n"
+    echo
+    return
+  elif [[ ! -f wp-config.php ]]; then echo Could not find wp-config.php! && return 9
+  fi
+  
+  if [[ -z "$2" || ! -f "$2" ]] ; then
+    echo "File does not exist: $2"
+    return 9
+  fi
+  
+  if [[ "$1" == "db" ]] ; then
+    if [[ $2 =~ \.sql\.gz$ ]] ; then
+      wpconn wpdbimportgz "$2"
+    elif [[ $2 =~ \.sql$ ]] ; then
+      wpconn wpdbimport "$2"
+    else
+      echo "Unknown file type. If you are sure, try the forcedb/forcegz option."
+    fi
+  elif [[ "$1" == "forcedb" ]] ; then
+    wpconn wpdbimport "$2"
+  elif [[ "$1" == "forcegz" ]] ; then
+    wpconn wpdbimportgz "$2"
+  else
+    echo "Unknown option"
+  fi
+}
+
+function wpstats() {
+  if [[ $1 == "--help" || $1 == "-h" ]]; then
+    echo -e "\nThis tool returns a basic overview of the Wordpress install.\n\nUsage:\n\n\twpstats\n" && return
+  elif [[ -n $1 ]]; then return
+  fi
+  echo
+  echo -e "\tWP version:\t"$(wpver -q | awk '{print $1}')
+  echo -e "\tStatus code:\t"$( temp=$(wptests -q); [[ $temp != "255" ]] && echo "OK" || echo "Error"!)
+  if wpdb -q; then
+    echo -e "\tUserID 1:\t"$(wpuser -q)
+    wpurl -q | awk '{print "\t"$2"("$1"):\t"$3}'
+    wptheme -q
+  fi
+  echo
+}
+
+function wptool() {
+  if [[ $1 == 'changes' ]] ; then
+    echo "Downloading ChangeLog..."
+    curl -f "https://raw.githubusercontent.com/bagley/wptool/master/ChangeLog" | less
+    return
+  elif [[ $1 == 'docs' ]] || [[ $1 == 'man' ]] ; then
+    echo "Downloading Readme..."
+    curl -f "https://raw.githubusercontent.com/bagley/wptool/master/README.md" \
+      | sed 's/####/* /g' | sed 's/###//g' | sed 's/##//g' |less
+    return
+  fi
+  echo "
+  _       ______  __              __  __  __
+ | |     / / __ \/ /_____  ____  / /  \ \/ /
+ | | /| / / /_/ / __/ __ \/ __ \/ /    \ \/
+ | |/ |/ / ____/ /_/ /_/ / /_/ / /     /\ \ 
+ |__/|__/_/    \__/\____/\____/_/     /_/\_\treeme Version
+                    a fixit now production
+
+  WPtool $wptoolv is suite of bash functions to administer Wordpress installs.
+  It assumes you are running said functions in the site's root folder. Each
+  command listed below has a -h option for more specific information:
+  
+  wpstats:  basic overview              wperr:    show most recent errors
+  wpurl:    URL tools                   wpfix:    built-in WP fixes 
+  wpdb:     db tools                    wpplug:   plugin tools
+  wpuser:   user tools                  wptheme:  theme tools
+  wpht:     .htaccess generator         wpscan:   scan for malware
+  wpcore:   core replacement tools      wptrace:  see what wp is doing
+  wpbackup: backup files and/or db      wprestore: restore database from file
+  wpver:    returns version info        wplogin:  login as first admin
+  
+  wptool man:  Manual page              wptool changes:  Changes and Updates
+"
+}
+
+# show a recent changes prompt for three weeks after last edit.
+# ie, let's inform the techs, but not annoy them
+# each edit is treated separatly
+recent_changes=""
+function __wptool_to_show_or_not() {
+  diff_edit="$(($(date +%s) - $edit))"
+  # the z is in case the above string does not work...
+  # if I get complaints I can change it to -n
+  #days_to_show=21 (1814400) 31 (2592000)
+  # I could use $(($days_to_show * 3600 * 24 )) but if the shell does not like it....
+  if [[ -z "$diff_edit" || $diff_edit -lt 1814400 ]] ; then
+    recent_changes="$recent_changes$edit_desc"
+  fi
+}
+# each edit is the current time in epoch seconds: date +%s
+# format:
+
+# edit="run: date +%s"
+# edit_desc="
+# \t <desc/func>  Description goes here.\n"
+# __wptool_to_show_or_not
+
+# ------- Changes -----------
+
+# wpscan
+edit="1424603108"
+edit_desc="
+\t wpscan       Scans the website for malware. See 'wpscan -h'\n"
+__wptool_to_show_or_not
+
+# wpuser access link
+edit="1424603108"
+edit_desc="
+\t wpuser USERID -l  
+\t              Generates a link for your browser which will
+\t              automatically log you in as the given user.
+\t              No more needing to create and remove 'deleteme'.
+\t              See 'wpuser -h'\n"
+__wptool_to_show_or_not
+
+# wpurl OLDURL NEWURL
+edit="1424570097"
+edit_desc="
+\t wpurl OLDURL NEWURL
+\t              Search and replace the given url in the database with
+\t              a new one. Useful for pics when changing the site url.
+\t              See 'wpurl -h'\n"
+__wptool_to_show_or_not
+
+# wptrace
+edit="1423962898"
+edit_desc="
+\t wptrace      Does an strace to help with wsod errors. See 'wptrace -h'\n"
+__wptool_to_show_or_not
+
+# wperr
+edit="1423962898"
+edit_desc="
+\t wperr        Shows the tail of main WP error logs.\n"
+__wptool_to_show_or_not
+
+# wpbackup/restore
+edit="1424570097"
+edit_desc="
+\t wpbackup/wprestore     Quick backup/restore. See their help pages.\n"
+__wptool_to_show_or_not
+
+# wplogin
+edit="1427342565"
+edit_desc="
+\t wplogin      Generates a link for your browser for the first
+\t              admin user it finds, allowing you to quickly get in.
+\t              No need to create 'deleteme' or search for usernames.\n"
+__wptool_to_show_or_not
+
+# wpdb -s
+edit="1427342565"
+edit_desc="
+\t wpdb -s      Shows all tables and their sizes, and total db size.\n"
+__wptool_to_show_or_not
+
+# wpplug
+edit="1427342565"
+edit_desc="
+\t wpplug disable <plugin>
+\t              Disable a single plugin in the database.\n
+\t wpplug disable-all
+\t wpplug restore-all
+\t              Easily disable and reenable all plugins.\n"
+__wptool_to_show_or_not
+
+# Fixed mysql output
+edit="1460524933"
+edit_desc="
+\t This includes a fix to the mysql output. The output was
+\t including the column header and was messing up multiple
+\t commands like wpplugin and wpuser. 
+\t But it's now back to working order on the effected mysql versions.\n"
+__wptool_to_show_or_not
+
+edit="1492132559"
+edit_desc="
+\t - Repair and optimize the database with: wpdb -r|-o
+\t - Reinstall all wordpress files in current and sub folders with:
+\t     wpcore --all
+\t - Fixed the quick scans to get all the .php files.
+\t - More scan strings.\n"
+__wptool_to_show_or_not
+
+# ------- End Changes ----------
+
+
+#search, multisite
+wptoolv="1.8.5"
+#echo -e "\n    Injected WPtool $wptoolv into the current session.\n
+#       For details and tool list,   type 'wptool'
+#       For manual and instructions, type 'wptool man'
+#       For a full list of changes,  type 'wptool changes'\n"
+
+wptool
+
+# display them if we have any
+if [[ -n "$recent_changes" ]] ; then
+  echo -en "\n         ===  Recent Improvements and New Things for WPTool  ===\n$recent_changes\n"
+  #echo -e "\t*To see all changes and updates run 'wptool changes'"
+fi
+
+#if [[ -n "$recent_changes" ]] ; then
+#  echo "                Scroll up to see a list of recent updates."
+#fi
+
+unset HISTFILE
